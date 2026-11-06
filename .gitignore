@@ -1,0 +1,11 @@
+# Too large for GitHub, see "Required downloads" in README.md
+*.gguf
+llamafile*
+*.exe
+
+# Runtime log
+server.log
+
+# macOS files
+.DS_Store
+._*
