@@ -45,13 +45,31 @@ cd /path/to/your/repo
 kod
 ```
 
-`kod` works on the folder you are standing in. It needs this line in `~/.zshrc`:
+`kod` works on the folder you are standing in. It needs two short commands in `~/.zshrc`. Add this once:
 
 ```bash
-alias kod='/Volumes/CLAUDEUSB/kod.command'
+# Local AI from the USB stick
+ai() {
+  [ -d /Volumes/CLAUDEUSB ] || { echo "The USB stick CLAUDEUSB is not plugged in"; return 1; }
+  /Volumes/CLAUDEUSB/iniciar.command
+}
+kod() {
+  [ -d /Volumes/CLAUDEUSB ] || { echo "The USB stick CLAUDEUSB is not plugged in"; return 1; }
+  /Volumes/CLAUDEUSB/kod.command "$@"
+}
 ```
 
-You can also pass a folder: `kod /path/to/your/repo`. Wait until the `Du>` prompt appears and type your question. Quit with `exit` – this also shuts down the server.
+Then run `source ~/.zshrc`.
+
+> If you have an older `alias kod=...` line in `~/.zshrc`, delete it first. zsh stops reading the file with a parse error when an alias and a function share a name.
+
+| Command | What it does |
+|---|---|
+| `ai` | Starts the server. Chat at http://localhost:8080 |
+| `kod` | Starts the server and the agent against the folder you are in |
+| `kod /path/to/your/repo` | Starts the server and the agent against a specific folder |
+
+Wait until the `Du>` prompt appears and type your question. Quit with `exit` – this also shuts down the server.
 
 ### Switch between repos
 
@@ -89,7 +107,7 @@ Now `kod` reuses the running server, and `exit` only closes the agent. The model
 ### Just chat in the browser
 
 ```bash
-/Volumes/CLAUDEUSB/iniciar.command
+ai
 ```
 
 (or double-click `iniciar.command` in Finder), then open **http://localhost:8080**. Stop it with `Ctrl+C` in Terminal.
