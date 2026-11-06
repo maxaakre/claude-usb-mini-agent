@@ -16,7 +16,7 @@ The model files are too large to ship with the scripts, so they must be download
 | What | Where to download | File |
 |---|---|---|
 | **AI model (required)** | [unsloth/Qwen3-4B-Instruct-2507-GGUF](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/tree/main) | `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` (~2.5 GB) |
-| **AI engine (required)** | [llamafile releases](https://github.com/mozilla-ai/llamafile/releases) – pick the latest | `llamafile-<version>` – rename it to `llamafile.exe` |
+| **AI engine (required)** | [llamafile releases](https://github.com/mozilla-ai/llamafile/releases) – pick the latest | `llamafile-<version>` – add `.exe` to the name, e.g. `llamafile.exe` |
 
 On the Hugging Face page, open **Files and versions** and download the file ending in **`Q4_K_M.gguf`**. Or download it straight to the stick from Terminal:
 
@@ -30,7 +30,7 @@ curl -L -o llamafile.exe \
 chmod +x llamafile.exe
 ```
 
-> On the llamafile releases page, download the asset named just **`llamafile-<version>`** (e.g. `llamafile-0.10.6`) – not `llamafile-thin`, `localscore` or the other tools. It's renamed to `llamafile.exe` so the start scripts keep working when you upgrade, and so it runs on Windows.
+> On the llamafile releases page, download the asset named just **`llamafile-<version>`** (e.g. `llamafile-0.10.6`) – not `llamafile-thin`, `localscore` or the other tools. The name must start with `llamafile` and end with `.exe`, for example `llamafile.exe` or `llamafile-0.10.6.exe`. The start scripts find the file by that pattern, and `.exe` lets it run on Windows. Keep only one version on the stick.
 >
 > Download the **`.gguf`** file – not the `.safetensors` files from the original Qwen repository, which llamafile can't read.
 
@@ -102,7 +102,7 @@ Now `kod` reuses the running server, and `exit` only closes the agent. The model
 
 | File | What it does |
 |---|---|
-| `llamafile.exe` | The AI engine itself (llama.cpp packaged as a single file that runs on Mac, Windows and Linux). |
+| `llamafile*.exe` | The AI engine itself (llama.cpp packaged as a single file that runs on Mac, Windows and Linux). |
 | `qwen3-4b-thinking-2507.Q4_K_M.gguf` | Model that "thinks" before answering – slower but better at code review and bug hunting. |
 | `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | Model without thinking – answers quickly, good for explanations and simple questions. |
 | `iniciar.command` | Starts the server on Mac. This is where you choose which model is used. |
@@ -146,7 +146,15 @@ cd "$(dirname "$0")"
 
 MODEL="Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
 
-./llamafile.exe --server --jinja -c 16384 --mlock --parallel 1 --model "$MODEL"
+# Hittar både llamafile.exe och versionsnamn som llamafile-0.10.6.exe
+ENGINE="$(ls llamafile*.exe 2>/dev/null | head -n 1)"
+if [ -z "$ENGINE" ]; then
+  echo "Hittar ingen llamafile*.exe i $PWD" >&2
+  exit 1
+fi
+
+# exec: llamafile tar över skriptets PID, så kod.command kan stänga servern
+exec "./$ENGINE" --server --jinja -c 16384 --mlock --parallel 1 --model "$MODEL"
 ```
 
 | Flag | Meaning |
@@ -157,6 +165,8 @@ MODEL="Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
 | `--mlock` | Loads the whole model into RAM up front instead of continuously reading from the slow stick. |
 | `--parallel 1` | One request at a time – saves memory. |
 
+`exec` replaces the script with llamafile, so they share one process. That is what lets `kod.command` shut the server down.
+
 ### 5. The agent – `agent.mjs`
 
 A Node script (Node 18+, no npm packages) that talks to the server through the API and gives the model four tools:
@@ -164,9 +174,9 @@ A Node script (Node 18+, no npm packages) that talks to the server through the A
 | Tool | What it does |
 |---|---|
 | `list_files` | Lists files and folders. |
-| `read_file` | Reads a file (max 40,000 characters). |
+| `read_file` | Reads a file (max 40,000 characters – longer files are cut off). |
 | `search` | Searches for text across all files. |
-| `write_file` | Writes a file – **shows the content and requires you to answer `j` (yes)** first. |
+| `write_file` | Writes a file – **shows the content and requires you to answer `j` (yes)** first. Refuses to overwrite files over 40,000 characters, because the model can't see all of them. |
 
 How it works:
 
@@ -174,7 +184,7 @@ How it works:
 2. The model decides which tools it needs and calls them (shown as grey `↳` lines).
 3. The results are sent back to the model, which continues until it has an answer (max 15 steps per question).
 
-**Security:** the agent can only access files **inside** the folder you specify. Attempts to read outside it (e.g. `../../`) are denied. Folders such as `node_modules`, `.git`, `dist` and `build` are ignored.
+**Security:** the agent can only access files **inside** the folder you specify. Attempts to reach outside it (e.g. `../../` or a symlink that points out of the folder) are denied. `search` and recursive listing skip symlinks. Folders such as `node_modules`, `.git`, `dist` and `build` are ignored.
 
 The project's full file list is included in the model's instructions, so it knows right away which files exist.
 
@@ -186,17 +196,39 @@ The project's full file list is included in the model's instructions, so it know
 #!/bin/bash
 PROJEKT="$(cd "${1:-$PWD}" && pwd)" || exit 1
 cd "$(dirname "$0")"
-if ! curl -s localhost:8080/health >/dev/null; then
+
+TIMEOUT=300 # sekunder – modellen läses från ett långsamt USB-minne
+
+# Klar = status ok och ett modell-API. En server som laddar svarar 503,
+# och en annan app på porten saknar /v1/models.
+server_ready() {
+  curl -s --max-time 2 localhost:8080/health | grep -Eq '"status" *: *"ok"' &&
+    curl -s --max-time 2 localhost:8080/v1/models | grep -Eq '"object" *: *"list"'
+}
+
+if ! server_ready; then
   echo "Startar modellen..."
   ./iniciar.command > server.log 2>&1 &
   SERVER_PID=$!
   trap "kill $SERVER_PID 2>/dev/null" EXIT
-  until curl -s localhost:8080/health | grep -q ok; do sleep 1; done
+  until server_ready; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "Servern kunde inte starta (är port 8080 upptagen?). Slutet av server.log:" >&2
+      tail -n 20 server.log >&2
+      exit 1
+    fi
+    if [ "$SECONDS" -ge "$TIMEOUT" ]; then
+      echo "Servern blev inte klar på $TIMEOUT sekunder. Slutet av server.log:" >&2
+      tail -n 20 server.log >&2
+      exit 1
+    fi
+    sleep 1
+  done
 fi
 node agent.mjs "$PROJEKT"
 ```
 
-Checks whether the server is already running, otherwise starts it in the background, waits until the model has loaded and then starts the agent. When the agent exits, the server is shut down.
+Checks whether the server is already running, otherwise starts it in the background, waits until the model has loaded and then starts the agent. If the server stops or isn't ready within 5 minutes, `kod` shows the end of `server.log` and quits. When the agent exits, a server started by `kod` is shut down.
 
 ---
 
@@ -272,11 +304,12 @@ Editor extensions such as **Continue** or **Cline** in VS Code can also use the 
 | Problem | Solution |
 |---|---|
 | `no such file or directory` | The file isn't where you think. Run `ls -la /Volumes/CLAUDEUSB`. |
-| macOS blocks the file | Right-click → **Open**, or run `xattr -c llamafile.exe *.gguf`. |
+| macOS blocks the file | Right-click → **Open**, or run `xattr -c llamafile*.exe *.gguf`. |
 | The model says it can't access files | You're typing in the web chat – use `kod.command` instead. Or ask explicitly: *"Read package.json"*. |
 | No grey `↳` lines in the agent | Check that `--jinja` is in `iniciar.command`. |
 | `command not found: #` in Terminal | Harmless – zsh doesn't treat `#` as a comment when pasting. |
 | Slow startup | The model is read from the stick. Copy the files to `~/llm/` on the internal disk for faster startup. |
+| `Servern kunde inte starta` | Read the log lines `kod` prints. Port 8080 may be in use: run `lsof -i :8080` to see by what. |
 | Anything else | Check `server.log`. |
 
 ### Warnings in the server log that can be ignored

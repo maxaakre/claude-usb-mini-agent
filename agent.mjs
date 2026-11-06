@@ -14,25 +14,44 @@ import path from 'node:path'
 import readline from 'node:readline/promises'
 import { stdin, stdout } from 'node:process'
 
-const ROOT = path.resolve(process.argv[2] || process.cwd())
+// realpath, så jämförelserna i safe() stämmer även om själva projektmappen nås via en symlänk
+const ROOT = await fs.realpath(path.resolve(process.argv[2] || process.cwd()))
 const API = (process.env.LLM_URL || 'http://localhost:8080/v1').replace(/\/$/, '')
 const MAX_READ = 40_000 // tecken per fil, så kontextfönstret inte sprängs
 const MAX_STEPS = 15 // max verktygsanrop per fråga
 const IGNORE = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.nuxt', '.output', 'coverage', '.DS_Store'])
 
 // ---------- Säkerhet: allt måste ligga inom ROOT ----------
-function safe(p = '.') {
+// Kontrollerar den verkliga sökvägen, så att symlänkar inte kan leda ut ur projektet.
+async function safe(p = '.') {
+  const deny = () => new Error(`Åtkomst nekad: ${p} ligger utanför ${ROOT}`)
+  const inside = (f) => f === ROOT || f.startsWith(ROOT + path.sep)
+
   const full = path.resolve(ROOT, p)
-  if (full !== ROOT && !full.startsWith(ROOT + path.sep)) {
-    throw new Error(`Åtkomst nekad: ${p} ligger utanför ${ROOT}`)
+  if (!inside(full)) throw deny()
+
+  // Filer som ska skapas finns inte än: gå uppåt till närmaste del som finns
+  let existing = full
+  const missing = []
+  while (true) {
+    try {
+      const real = await fs.realpath(existing)
+      if (!inside(real)) throw deny()
+      return path.join(real, ...missing)
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e
+      // Brusten symlänk: en skrivning skulle följa länken till dess mål
+      if (await fs.lstat(existing).catch(() => null)) throw deny()
+      missing.unshift(path.basename(existing))
+      existing = path.dirname(existing)
+    }
   }
-  return full
 }
 const rel = (full) => path.relative(ROOT, full) || '.'
 
 async function* walk(dir) {
   for (const e of await fs.readdir(dir, { withFileTypes: true })) {
-    if (IGNORE.has(e.name) || e.name.startsWith('._')) continue
+    if (IGNORE.has(e.name) || e.name.startsWith('._') || e.isSymbolicLink()) continue
     const full = path.join(dir, e.name)
     if (e.isDirectory()) yield* walk(full)
     else yield full
@@ -52,7 +71,7 @@ const tools = {
       },
     },
     async run({ path: p = '.', recursive = false }) {
-      const dir = safe(p)
+      const dir = await safe(p)
       if (recursive) {
         const out = []
         for await (const f of walk(dir)) {
@@ -77,8 +96,9 @@ const tools = {
       required: ['path'],
     },
     async run({ path: p }) {
-      const text = await fs.readFile(safe(p), 'utf8')
-      return text.length > MAX_READ ? text.slice(0, MAX_READ) + '\n… (avklippt)' : text
+      const text = await fs.readFile(await safe(p), 'utf8')
+      if (text.length <= MAX_READ) return text
+      return text.slice(0, MAX_READ) + `\n… (avklippt: visar ${MAX_READ} av ${text.length} tecken, filen kan inte skrivas över)`
     },
   },
 
@@ -95,7 +115,7 @@ const tools = {
     async run({ query, path: p = '.' }) {
       const q = query.toLowerCase()
       const hits = []
-      for await (const f of walk(safe(p))) {
+      for await (const f of walk(await safe(p))) {
         let text
         try {
           const stat = await fs.stat(f)
@@ -123,7 +143,15 @@ const tools = {
       required: ['path', 'content'],
     },
     async run({ path: p, content }) {
-      const full = safe(p)
+      const full = await safe(p)
+      // read_file visar bara början av stora filer, så en överskrivning skulle radera resten
+      const old = await fs.readFile(full, 'utf8').catch((e) => {
+        if (e.code === 'ENOENT') return ''
+        throw e
+      })
+      if (old.length > MAX_READ) {
+        return `Nekat: ${rel(full)} är för stor (${old.length} tecken). Agenten ser bara de första ${MAX_READ} tecknen, så resten skulle raderas.`
+      }
       console.log(`\n\x1b[33m--- Modellen vill skriva ${rel(full)} (${content.length} tecken) ---\x1b[0m`)
       console.log(content.length > 2000 ? content.slice(0, 2000) + '\n…' : content)
       const ok = (await rl.question('\x1b[33mGodkänn? (j/n) \x1b[0m')).trim().toLowerCase()
@@ -175,6 +203,7 @@ while (true) {
   const q = (await rl.question('\n\x1b[32mDu> \x1b[0m')).trim()
   if (!q) continue
   if (q === 'exit' || q === 'quit') break
+  const turnStart = messages.length
   messages.push({ role: 'user', content: q })
 
   try {
@@ -205,7 +234,7 @@ while (true) {
     }
   } catch (e) {
     console.error(`\x1b[31m${e.message}\x1b[0m`)
-    messages.pop()
+    messages.length = turnStart // ta bort hela frågan, så inga verktygsanrop blir utan svar
   }
 }
 
