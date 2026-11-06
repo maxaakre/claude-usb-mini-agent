@@ -180,7 +180,7 @@ A Node script (Node 18+, no npm packages) that talks to the server through the A
 
 How it works:
 
-1. You ask a question.
+1. You ask a question. While the model works, a spinner shows `Tänker... 12s` ("Thinking...").
 2. The model decides which tools it needs and calls them (shown as grey `↳` lines).
 3. The results are sent back to the model, which continues until it has an answer (max 15 steps per question).
 

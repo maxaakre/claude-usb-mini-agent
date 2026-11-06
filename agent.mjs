@@ -184,14 +184,36 @@ const messages = [
   },
 ]
 
+// Visar en snurra tills den returnerade funktionen anropas. Bara i en riktig terminal.
+function startSpinner() {
+  if (!stdout.isTTY) return () => {}
+  const frames = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  const started = Date.now()
+  let frame = 0
+  const timer = setInterval(() => {
+    const seconds = Math.floor((Date.now() - started) / 1000)
+    // \r går till radens början, \x1b[K rensar resten av raden
+    stdout.write(`\r\x1b[90m${frames[frame++ % frames.length]} Tänker... ${seconds}s\x1b[0m\x1b[K`)
+  }, 100)
+  return () => {
+    clearInterval(timer)
+    stdout.write('\r\x1b[K')
+  }
+}
+
 async function chat() {
-  const res = await fetch(`${API}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'local', messages, tools: toolSpec, temperature: 0.6 }),
-  })
-  if (!res.ok) throw new Error(`Servern svarade ${res.status}: ${await res.text()}`)
-  return (await res.json()).choices[0].message
+  const stopSpinner = startSpinner()
+  try {
+    const res = await fetch(`${API}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'local', messages, tools: toolSpec, temperature: 0.6 }),
+    })
+    if (!res.ok) throw new Error(`Servern svarade ${res.status}: ${await res.text()}`)
+    return (await res.json()).choices[0].message
+  } finally {
+    stopSpinner()
+  }
 }
 
 const rl = readline.createInterface({ input: stdin, output: stdout })
