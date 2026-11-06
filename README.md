@@ -192,9 +192,9 @@ A Node script (Node 18+, no npm packages) that talks to the server through the A
 | Tool | What it does |
 |---|---|
 | `list_files` | Lists files and folders. |
-| `read_file` | Reads a file (max 40,000 characters – longer files are cut off). |
+| `read_file` | Reads a file (max 24,000 characters – longer files are cut off). |
 | `search` | Searches for text across all files. |
-| `write_file` | Writes a file – **shows the content and requires you to answer `j` (yes)** first. Refuses to overwrite files over 40,000 characters, because the model can't see all of them. |
+| `write_file` | Writes a file – **shows every changed line as a diff and requires you to answer `j` (yes)** first. Refuses to overwrite files over 24,000 characters, because the model can't see all of them. |
 
 How it works:
 
@@ -205,6 +205,8 @@ How it works:
 **Security:** the agent can only access files **inside** the folder you specify. Attempts to reach outside it (e.g. `../../` or a symlink that points out of the folder) are denied. `search` and recursive listing skip symlinks. Folders such as `node_modules`, `.git`, `dist` and `build` are ignored.
 
 The project's full file list is included in the model's instructions, so it knows right away which files exist.
+
+**Memory:** the model can only hold about 16,000 tokens. When the conversation gets too long, the agent first removes old file contents, then the oldest questions. You see a grey `(Rensade gammal historik...)` line when this happens. The model may forget earlier parts of the conversation, but it can read files again.
 
 > The agent's interface is in Swedish: `Du>` means "You>", `AI>` is the answer, and `Godkänn? (j/n)` means "Approve? (y/n)" – answer `j` or `y` to approve.
 

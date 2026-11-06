@@ -17,7 +17,8 @@ import { stdin, stdout } from 'node:process'
 // realpath, så jämförelserna i safe() stämmer även om själva projektmappen nås via en symlänk
 const ROOT = await fs.realpath(path.resolve(process.argv[2] || process.cwd()))
 const API = (process.env.LLM_URL || 'http://localhost:8080/v1').replace(/\/$/, '')
-const MAX_READ = 40_000 // tecken per fil, så kontextfönstret inte sprängs
+const MAX_READ = 24_000 // tecken per fil: en fil måste få plats både när den läses och när den skrivs om
+const MAX_HISTORY = 40_000 // tecken i historiken, ca 12k av 16k tokens, resten blir plats för svaret
 const MAX_STEPS = 15 // max verktygsanrop per fråga
 const IGNORE = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.nuxt', '.output', 'coverage', '.DS_Store'])
 
@@ -58,6 +59,80 @@ async function* walk(dir) {
   }
 }
 
+// ---------- Visa ändringar ----------
+// Gör kontrolltecken synliga, så att filinnehåll inte kan dölja rader eller lura terminalen
+const showable = (text) =>
+  text
+    .replace(/[\x00-\x08\x0a-\x1f]/g, (c) => String.fromCharCode(0x2400 + c.charCodeAt(0)))
+    .replace(/[\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, '\ufffd')
+
+// Längsta gemensamma delsekvens. Returnerar [tecken, rad] där tecken är ' ', '-' eller '+'.
+function diffMiddle(a, b) {
+  const removed = a.map((line) => ['-', line])
+  const added = b.map((line) => ['+', line])
+  if (a.length * b.length > 4_000_000) return [...removed, ...added] // för stort: visa som ett block
+
+  const width = b.length + 1
+  const lcs = new Uint32Array((a.length + 1) * width)
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      lcs[i * width + j] = a[i] === b[j]
+        ? lcs[(i + 1) * width + j + 1] + 1
+        : Math.max(lcs[(i + 1) * width + j], lcs[i * width + j + 1])
+    }
+  }
+
+  const ops = []
+  let i = 0
+  let j = 0
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      ops.push([' ', a[i]])
+      i++
+      j++
+    } else if (lcs[(i + 1) * width + j] >= lcs[i * width + j + 1]) {
+      ops.push(removed[i++])
+    } else {
+      ops.push(added[j++])
+    }
+  }
+  return [...ops, ...removed.slice(i), ...added.slice(j)]
+}
+
+function diffLines(oldText, newText) {
+  const a = oldText ? oldText.split('\n') : []
+  const b = newText ? newText.split('\n') : []
+  // Oförändrad början och slut behöver inte jämföras rad mot rad
+  let start = 0
+  while (start < a.length && start < b.length && a[start] === b[start]) start++
+  let endA = a.length
+  let endB = b.length
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--
+    endB--
+  }
+  const same = (lines) => lines.map((line) => [' ', line])
+  return [
+    ...same(a.slice(0, start)),
+    ...diffMiddle(a.slice(start, endA), b.slice(start, endB)),
+    ...same(a.slice(endA)),
+  ]
+}
+
+// Skriver ut alla ändrade rader, med 3 rader sammanhang runt dem
+function printDiff(ops) {
+  const CONTEXT = 3
+  const colors = { '+': '\x1b[32m', '-': '\x1b[31m', ' ': '\x1b[90m' }
+  const changed = ops.flatMap(([op], i) => (op === ' ' ? [] : [i]))
+  let printedTo = -1
+  for (const i of changed) {
+    const from = Math.max(i - CONTEXT, printedTo + 1)
+    const to = Math.min(i + CONTEXT, ops.length - 1)
+    if (printedTo >= 0 && from > printedTo + 1) console.log('\x1b[90m…\x1b[0m')
+    for (let k = from; k <= to; k++) console.log(`${colors[ops[k][0]]}${ops[k][0]} ${showable(ops[k][1])}\x1b[0m`)
+    printedTo = Math.max(printedTo, to)
+  }
+}
 
 // ---------- Verktyg ----------
 const tools = {
@@ -146,14 +221,19 @@ const tools = {
       const full = await safe(p)
       // read_file visar bara början av stora filer, så en överskrivning skulle radera resten
       const old = await fs.readFile(full, 'utf8').catch((e) => {
-        if (e.code === 'ENOENT') return ''
+        if (e.code === 'ENOENT') return null // ny fil
         throw e
       })
-      if (old.length > MAX_READ) {
+      if (old === content) return `Ingen ändring: ${rel(full)} har redan det innehållet.`
+      if (old?.length > MAX_READ) {
         return `Nekat: ${rel(full)} är för stor (${old.length} tecken). Agenten ser bara de första ${MAX_READ} tecknen, så resten skulle raderas.`
       }
-      console.log(`\n\x1b[33m--- Modellen vill skriva ${rel(full)} (${content.length} tecken) ---\x1b[0m`)
-      console.log(content.length > 2000 ? content.slice(0, 2000) + '\n…' : content)
+      const name = showable(rel(full))
+      const ops = diffLines(old, content)
+      const count = (sign) => ops.filter(([op]) => op === sign).length
+      console.log(`\n\x1b[33m--- Modellen vill ${old === null ? 'skapa' : 'ändra'} ${name} ---\x1b[0m`)
+      printDiff(ops)
+      console.log(`\x1b[33m--- ${name}: +${count('+')} −${count('-')} rader ---\x1b[0m`)
       const ok = (await rl.question('\x1b[33mGodkänn? (j/n) \x1b[0m')).trim().toLowerCase()
       if (ok !== 'j' && ok !== 'y') return 'Användaren nekade skrivningen.'
       await fs.mkdir(path.dirname(full), { recursive: true })
@@ -180,9 +260,37 @@ const messages = [
       `${ROOT} via verktygen list_files, read_file, search och write_file. Säg aldrig att du saknar åtkomst ` +
       `till filer – anropa verktygen istället. Läs alltid relevanta filer med read_file innan du svarar om koden. ` +
       `Alla sökvägar är relativa till projektroten. Använd write_file bara när användaren ber om ändringar. ` +
+      `Om ett verktygssvar är borttaget ur historiken ska du läsa filen igen innan du ändrar den. ` +
       `Svara på samma språk som användaren.\n\nFiler i projektet:\n${tree}`,
   },
 ]
+
+// ---------- Historik: håll den inom kontextfönstret ----------
+const REMOVED = '(Borttaget för att spara minne. Läs filen igen med read_file om du behöver innehållet.)'
+const historySize = () => messages.reduce((sum, m) => sum + JSON.stringify(m).length, 0)
+
+// Tar bort det som är minst värt först. Hela frågor tas bort, så att varje
+// verktygsanrop behåller sitt svar. limit 0 tömmer också de senaste verktygssvaren.
+function trimHistory(limit) {
+  if (historySize() <= limit) return
+  const lastAssistant = messages.findLastIndex((m) => m.role === 'assistant')
+  const emptyTools = (end) => {
+    for (const m of messages.slice(0, end)) {
+      if (historySize() <= limit) return
+      if (m.role === 'tool') m.content = REMOVED
+    }
+  }
+
+  emptyTools(lastAssistant) // det senaste svaret behövs för nästa steg
+  while (historySize() > limit) {
+    const nextQuestion = messages.findIndex((m, i) => i > 1 && m.role === 'user')
+    if (nextQuestion === -1) break // bara den pågående frågan är kvar
+    messages.splice(1, nextQuestion - 1)
+  }
+  emptyTools(messages.length - 1) // flera filer lästa i samma steg: behåll bara den sista
+  if (limit === 0) emptyTools(messages.length)
+  console.log('\r\x1b[K\x1b[90m(Rensade gammal historik för att spara minne)\x1b[0m')
+}
 
 // Visar en snurra tills den returnerade funktionen anropas. Bara i en riktig terminal.
 function startSpinner() {
@@ -204,13 +312,21 @@ function startSpinner() {
 async function chat() {
   const stopSpinner = startSpinner()
   try {
-    const res = await fetch(`${API}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'local', messages, tools: toolSpec, temperature: 0.6 }),
-    })
-    if (!res.ok) throw new Error(`Servern svarade ${res.status}: ${await res.text()}`)
-    return (await res.json()).choices[0].message
+    let res
+    let body
+    // Tät text som JSON ger fler tokens per tecken, så servern kan säga nej ändå. Rensa hårdare då.
+    for (const limit of [MAX_HISTORY, MAX_HISTORY / 2, 0]) {
+      trimHistory(limit)
+      res = await fetch(`${API}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'local', messages, tools: toolSpec, temperature: 0.6 }),
+      })
+      body = await res.text()
+      if (!body.includes('exceed_context_size')) break
+    }
+    if (!res.ok) throw new Error(`Servern svarade ${res.status}: ${body}`)
+    return JSON.parse(body).choices[0].message
   } finally {
     stopSpinner()
   }
@@ -225,8 +341,8 @@ while (true) {
   const q = (await rl.question('\n\x1b[32mDu> \x1b[0m')).trim()
   if (!q) continue
   if (q === 'exit' || q === 'quit') break
-  const turnStart = messages.length
-  messages.push({ role: 'user', content: q })
+  const question = { role: 'user', content: q }
+  messages.push(question)
 
   try {
     for (let step = 0; step < MAX_STEPS; step++) {
@@ -256,7 +372,7 @@ while (true) {
     }
   } catch (e) {
     console.error(`\x1b[31m${e.message}\x1b[0m`)
-    messages.length = turnStart // ta bort hela frågan, så inga verktygsanrop blir utan svar
+    messages.length = messages.indexOf(question) // ta bort hela frågan, så inga verktygsanrop blir utan svar
   }
 }
 
